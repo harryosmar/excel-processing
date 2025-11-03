@@ -33,69 +33,8 @@ type Config struct {
 
 // RowProcessor defines the interface for processing each row
 type RowProcessor interface {
-	Process(rowIndex int, row []string) error
-}
-
-// ExampleProcessor is a sample implementation of RowProcessor
-type ExampleProcessor struct {
-	processedCount int64
-	batchSize      int
-	batch          [][]string
-}
-
-func NewExampleProcessor(batchSize int) *ExampleProcessor {
-	return &ExampleProcessor{
-		batchSize: batchSize,
-		batch:     make([][]string, 0, batchSize),
-	}
-}
-
-func (p *ExampleProcessor) Process(rowIndex int, row []string) error {
-	p.batch = append(p.batch, row)
-	p.processedCount++
-
-	// Process in batches to improve performance
-	if len(p.batch) >= p.batchSize {
-		if err := p.flush(); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (p *ExampleProcessor) flush() error {
-	if len(p.batch) == 0 {
-		return nil
-	}
-
-	// Here you would typically:
-	// - Insert into database
-	// - Write to another file
-	// - Send to message queue
-	// - Perform calculations
-
-	// For demonstration, we'll just count
-	log.Printf("Flushing batch of %d rows", len(p.batch))
-
-	// Clear the batch to free memory
-	p.batch = p.batch[:0]
-
-	// Force garbage collection periodically to prevent memory buildup
-	if p.processedCount%500000 == 0 {
-		runtime.GC()
-	}
-
-	return nil
-}
-
-func (p *ExampleProcessor) Finalize() error {
-	// Process any remaining rows in the batch
-	if err := p.flush(); err != nil {
-		return err
-	}
-	log.Printf("Total rows processed: %d", p.processedCount)
-	return nil
+	ProcessSheet(rowIndex int, row []string) error
+	Finalize() error
 }
 
 // ChunkUploader uploads batches as Excel chunks to S3
@@ -122,7 +61,7 @@ func NewChunkUploader(ctx context.Context, s3Client *s3.Client, bucketName, base
 	}
 }
 
-func (c *ChunkUploader) Process(rowIndex int, row []string) error {
+func (c *ChunkUploader) ProcessSheet(rowIndex int, row []string) error {
 	// Save first row as header
 	if rowIndex == 0 {
 		c.headerRow = make([]string, len(row))
@@ -264,7 +203,7 @@ func (r *ExcelReader) ProcessSheet(sheetName string) error {
 			return fmt.Errorf("failed to read row %d: %w", rowIndex, err)
 		}
 
-		if err := r.processor.Process(rowIndex, row); err != nil {
+		if err := r.processor.ProcessSheet(rowIndex, row); err != nil {
 			return fmt.Errorf("failed to process row %d: %w", rowIndex, err)
 		}
 
@@ -280,58 +219,14 @@ func (r *ExcelReader) ProcessSheet(sheetName string) error {
 }
 
 // DownloadAndProcessExcel downloads an Excel file from S3 and processes it with streaming
-func DownloadAndProcessExcel(ctx context.Context, cfg Config, processor RowProcessor) error {
+func DownloadAndProcessExcel(ctx context.Context, s3Client *s3.Client, cfg Config, processor RowProcessor) error {
 	startTime := time.Now()
 	log.Printf("Starting Excel processing from S3")
-
-	// Initialize AWS SDK v2 config
-	var awsCfg aws.Config
-	var err error
-
-	if cfg.Endpoint != "" {
-		// Custom endpoint (MinIO or S3-compatible)
-		customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			return aws.Endpoint{
-				URL:               cfg.Endpoint,
-				HostnameImmutable: true,
-				SigningRegion:     cfg.Region,
-			}, nil
-		})
-
-		awsCfg, err = awsconfig.LoadDefaultConfig(ctx,
-			awsconfig.WithRegion(cfg.Region),
-			awsconfig.WithEndpointResolverWithOptions(customResolver),
-			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-				cfg.AccessKeyID,
-				cfg.SecretAccessKey,
-				"",
-			)),
-		)
-	} else {
-		// Standard AWS S3
-		awsCfg, err = awsconfig.LoadDefaultConfig(ctx,
-			awsconfig.WithRegion(cfg.Region),
-			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-				cfg.AccessKeyID,
-				cfg.SecretAccessKey,
-				"",
-			)),
-		)
-	}
-
-	if err != nil {
-		return fmt.Errorf("failed to load AWS config: %w", err)
-	}
-
-	// Create S3 client
-	s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		o.UsePathStyle = cfg.ForcePathStyle
-	})
 
 	log.Printf("Connected to S3 (Region: %s, Endpoint: %s)", cfg.Region, cfg.Endpoint)
 
 	// Check if bucket exists (optional, HeadBucket)
-	_, err = s3Client.HeadBucket(ctx, &s3.HeadBucketInput{
+	_, err := s3Client.HeadBucket(ctx, &s3.HeadBucketInput{
 		Bucket: aws.String(cfg.BucketName),
 	})
 	if err != nil {
@@ -371,7 +266,7 @@ func DownloadAndProcessExcel(ctx context.Context, cfg Config, processor RowProce
 	sheets := file.GetSheetList()
 	log.Printf("Found %d sheet(s): %v", len(sheets), sheets)
 
-	// Process each sheet
+	// ProcessSheet each sheet
 	reader := NewExcelReader(file, processor)
 	for _, sheetName := range sheets {
 		if err := reader.ProcessSheet(sheetName); err != nil {
@@ -380,10 +275,8 @@ func DownloadAndProcessExcel(ctx context.Context, cfg Config, processor RowProce
 	}
 
 	// Finalize processing
-	if finalizer, ok := processor.(interface{ Finalize() error }); ok {
-		if err := finalizer.Finalize(); err != nil {
-			return fmt.Errorf("failed to finalize processing: %w", err)
-		}
+	if err = processor.Finalize(); err != nil {
+		return fmt.Errorf("failed to finalize processing: %w", err)
 	}
 
 	duration := time.Since(startTime)
@@ -435,9 +328,9 @@ func main() {
 
 	// Load configuration from environment variables
 	config := Config{
-		Region: getEnv("AWS_REGION", "us-east-1"),
-		// Endpoint:        getEnv("S3_ENDPOINT", "http://host.docker.internal:9000"), // Empty for AWS S3, set for MinIO host.docker.internal
-		Endpoint:        getEnv("S3_ENDPOINT", "http://localhost:9000"), // Empty for AWS S3, set for MinIO host.docker.internal
+		Region:   getEnv("AWS_REGION", "us-east-1"),
+		Endpoint: getEnv("S3_ENDPOINT", "http://host.docker.internal:9000"), // Empty for AWS S3, set for MinIO host.docker.internal
+		// Endpoint:        getEnv("S3_ENDPOINT", "http://localhost:9000"), // Empty for AWS S3, set for MinIO host.docker.internal
 		AccessKeyID:     getEnv("AWS_ACCESS_KEY_ID", "minioadmin"),
 		SecretAccessKey: getEnv("AWS_SECRET_ACCESS_KEY", "minioadmin"),
 		BucketName:      getEnv("S3_BUCKET", "excel-files"),
@@ -446,11 +339,10 @@ func main() {
 	}
 
 	// Get processing mode
-	mode := getEnv("PROCESSING_MODE", "chunk") // "read" or "chunk"
-	chunkSize := 10000                         // Default: 10k rows per chunk
+	chunkSize := 10000 // Default: 10k rows per chunk
 
-	log.Printf("Configuration: Region=%s, Endpoint=%s, Bucket=%s, File=%s, Mode=%s",
-		config.Region, config.Endpoint, config.BucketName, config.ObjectName, mode)
+	log.Printf("Configuration: Region=%s, Endpoint=%s, Bucket=%s, File=%s",
+		config.Region, config.Endpoint, config.BucketName, config.ObjectName)
 
 	// Create context with timeout (adjust based on Lambda timeout)
 	// For Lambda: use context from Lambda handler or set shorter timeout
@@ -464,62 +356,56 @@ func main() {
 
 	var processor RowProcessor
 
-	if mode == "chunk" {
-		// Mode: Create chunks and upload to S3
-		log.Printf("Mode: Split file into chunks and upload to S3")
-		log.Printf("Chunk size: %d rows per file", chunkSize)
+	// Mode: Create chunks and upload to S3
+	log.Printf("Mode: Split file into chunks and upload to S3")
+	log.Printf("Chunk size: %d rows per file", chunkSize)
 
-		// Initialize S3 client for uploading chunks
-		var awsCfg aws.Config
+	// Initialize S3 client for uploading chunks
+	var awsCfg aws.Config
 
-		if config.Endpoint != "" {
-			customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-				return aws.Endpoint{
-					URL:               config.Endpoint,
-					HostnameImmutable: true,
-					SigningRegion:     config.Region,
-				}, nil
-			})
-
-			awsCfg, err = awsconfig.LoadDefaultConfig(ctx,
-				awsconfig.WithRegion(config.Region),
-				awsconfig.WithEndpointResolverWithOptions(customResolver),
-				awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-					config.AccessKeyID,
-					config.SecretAccessKey,
-					"",
-				)),
-			)
-		} else {
-			awsCfg, err = awsconfig.LoadDefaultConfig(ctx,
-				awsconfig.WithRegion(config.Region),
-				awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-					config.AccessKeyID,
-					config.SecretAccessKey,
-					"",
-				)),
-			)
-		}
-
-		if err != nil {
-			log.Fatalf("Failed to load AWS config: %v", err)
-		}
-
-		s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-			o.UsePathStyle = config.ForcePathStyle
+	if config.Endpoint != "" {
+		customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{
+				URL:               config.Endpoint,
+				HostnameImmutable: true,
+				SigningRegion:     config.Region,
+			}, nil
 		})
 
-		// Extract base filename without extension
-		baseFileName := strings.TrimSuffix(config.ObjectName, ".xlsx")
-		processor = NewChunkUploader(ctx, s3Client, config.BucketName, baseFileName, chunkSize)
+		awsCfg, err = awsconfig.LoadDefaultConfig(ctx,
+			awsconfig.WithRegion(config.Region),
+			awsconfig.WithEndpointResolverWithOptions(customResolver),
+			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+				config.AccessKeyID,
+				config.SecretAccessKey,
+				"",
+			)),
+		)
 	} else {
-		// Mode: Just read and process (no chunking)
-		log.Printf("Mode: Read and process (no chunking)")
-		processor = NewExampleProcessor(1000)
+		awsCfg, err = awsconfig.LoadDefaultConfig(ctx,
+			awsconfig.WithRegion(config.Region),
+			awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+				config.AccessKeyID,
+				config.SecretAccessKey,
+				"",
+			)),
+		)
 	}
 
-	// Process the Excel file
-	if err := DownloadAndProcessExcel(ctx, config, processor); err != nil {
+	if err != nil {
+		log.Fatalf("Failed to load AWS config: %v", err)
+	}
+
+	s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.UsePathStyle = config.ForcePathStyle
+	})
+
+	// Extract base filename without extension
+	baseFileName := strings.TrimSuffix(config.ObjectName, ".xlsx")
+	processor = NewChunkUploader(ctx, s3Client, config.BucketName, baseFileName, chunkSize)
+
+	// ProcessSheet the Excel file
+	if err := DownloadAndProcessExcel(ctx, s3Client, config, processor); err != nil {
 		log.Fatalf("Error processing Excel file: %v", err)
 	}
 
