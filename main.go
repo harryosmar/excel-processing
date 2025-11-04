@@ -10,7 +10,6 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -31,257 +30,259 @@ type Config struct {
 	ForcePathStyle  bool // Set to true for MinIO/S3-compatible services
 }
 
-// RowProcessor defines the interface for processing each row
-type RowProcessor interface {
-	ProcessSheet(rowIndex int, row []string) error
-	Finalize() error
+// ChunkCombiner combines multiple chunk files from S3 into one Excel file
+type ChunkCombiner struct {
+	s3Client        *s3.Client
+	ctx             context.Context
+	bucketName      string
+	chunkPrefix     string
+	outputFileName  string
+	streamWriter    *excelize.StreamWriter
+	file            *excelize.File
+	currentRow      int
+	currentSheet    int
+	headerWritten   bool
+	maxRowsPerSheet int
 }
 
-// ChunkUploader uploads batches as Excel chunks to S3
-type ChunkUploader struct {
-	processedCount int64
-	batchSize      int
-	batch          [][]string
-	chunkNumber    int
-	s3Client       *s3.Client
-	ctx            context.Context
-	bucketName     string
-	baseFileName   string
-	headerRow      []string
-}
-
-func NewChunkUploader(ctx context.Context, s3Client *s3.Client, bucketName, baseFileName string, batchSize int) *ChunkUploader {
-	return &ChunkUploader{
-		ctx:          ctx,
-		s3Client:     s3Client,
-		bucketName:   bucketName,
-		baseFileName: baseFileName,
-		batchSize:    batchSize,
-		batch:        make([][]string, 0, batchSize),
-	}
-}
-
-func (c *ChunkUploader) ProcessSheet(rowIndex int, row []string) error {
-	// Save first row as header
-	if rowIndex == 0 {
-		c.headerRow = make([]string, len(row))
-		copy(c.headerRow, row)
-		return nil
-	}
-
-	c.batch = append(c.batch, row)
-	c.processedCount++
-
-	// Upload chunk when batch is full
-	if len(c.batch) >= c.batchSize {
-		if err := c.uploadChunk(); err != nil {
-			return err
-		}
-	}
-
-	// Log progress every 100k rows
-	if c.processedCount%100000 == 0 {
-		log.Printf("Processed %d rows | Uploaded %d chunks", c.processedCount, c.chunkNumber)
-	}
-
-	return nil
-}
-
-func (c *ChunkUploader) uploadChunk() error {
-	if len(c.batch) == 0 {
-		return nil
-	}
-
-	c.chunkNumber++
-	startTime := time.Now()
-	log.Printf("Creating chunk %d with %d rows...", c.chunkNumber, len(c.batch))
-
-	// Create new Excel file
+// NewChunkCombiner creates a new chunk combiner
+func NewChunkCombiner(ctx context.Context, s3Client *s3.Client, bucketName, chunkPrefix, outputFileName string) (*ChunkCombiner, error) {
+	// Create new Excel file for output
 	f := excelize.NewFile()
-	defer f.Close()
-
 	sheetName := "Sheet1"
-	index, err := f.NewSheet(sheetName)
+
+	// Create stream writer for memory-efficient writing
+	streamWriter, err := f.NewStreamWriter(sheetName)
 	if err != nil {
-		return fmt.Errorf("failed to create sheet: %w", err)
+		return nil, fmt.Errorf("failed to create stream writer: %w", err)
 	}
-	f.SetActiveSheet(index)
 
-	// Write header row
-	if c.headerRow != nil {
-		for colIdx, value := range c.headerRow {
-			cell, _ := excelize.CoordinatesToCellName(colIdx+1, 1)
-			f.SetCellValue(sheetName, cell, value)
+	return &ChunkCombiner{
+		s3Client:        s3Client,
+		ctx:             ctx,
+		bucketName:      bucketName,
+		chunkPrefix:     chunkPrefix,
+		outputFileName:  outputFileName,
+		file:            f,
+		streamWriter:    streamWriter,
+		currentRow:      1,
+		currentSheet:    1,
+		headerWritten:   false,
+		maxRowsPerSheet: 1048576, // Excel's maximum rows per sheet
+	}, nil
+}
+
+// CombineChunks combines all chunk files from S3 into one Excel file
+func (c *ChunkCombiner) CombineChunks() error {
+	startTime := time.Now()
+	log.Printf("Starting chunk combination from S3...")
+	log.Printf("Bucket: %s, Prefix: %s", c.bucketName, c.chunkPrefix)
+
+	// List all chunk files
+	listInput := &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.bucketName),
+		Prefix: aws.String(c.chunkPrefix),
+	}
+
+	result, err := c.s3Client.ListObjectsV2(c.ctx, listInput)
+	if err != nil {
+		return fmt.Errorf("failed to list chunk files: %w", err)
+	}
+
+	if len(result.Contents) == 0 {
+		return fmt.Errorf("no chunk files found with prefix: %s", c.chunkPrefix)
+	}
+
+	log.Printf("Found %d chunk files to combine", len(result.Contents))
+
+	// Process each chunk file
+	totalRows := 0
+	for idx, obj := range result.Contents {
+		chunkKey := *obj.Key
+		log.Printf("Processing chunk %d/%d: %s", idx+1, len(result.Contents), chunkKey)
+
+		rowsProcessed, err := c.processChunkFile(chunkKey)
+		if err != nil {
+			return fmt.Errorf("failed to process chunk %s: %w", chunkKey, err)
 		}
+
+		totalRows += rowsProcessed
+		log.Printf("✓ Processed %s: %d rows (total: %d)", chunkKey, rowsProcessed, totalRows)
+
+		// Force GC after each chunk to free memory immediately
+		runtime.GC()
 	}
 
-	// Write data rows
-	for rowIdx, row := range c.batch {
-		for colIdx, value := range row {
-			cell, _ := excelize.CoordinatesToCellName(colIdx+1, rowIdx+2) // +2 because header is row 1
-			f.SetCellValue(sheetName, cell, value)
-		}
+	// Flush stream writer
+	if err := c.streamWriter.Flush(); err != nil {
+		return fmt.Errorf("failed to flush stream writer: %w", err)
 	}
 
-	// Write to buffer
+	log.Printf("Writing combined file to temporary buffer...")
+
+	// Write to buffer (needed for S3 upload with proper content length)
 	var buf bytes.Buffer
-	if err := f.Write(&buf); err != nil {
+	if err := c.file.Write(&buf); err != nil {
 		return fmt.Errorf("failed to write Excel to buffer: %w", err)
 	}
 
-	// Generate chunk filename
-	chunkKey := fmt.Sprintf("%s_chunk_%04d.xlsx", c.baseFileName, c.chunkNumber)
-	log.Printf("Uploading chunk %d to s3://%s/%s (size: %.2f MB)...",
-		c.chunkNumber,
-		c.bucketName,
-		chunkKey,
+	log.Printf("Uploading combined file to S3: %s (size: %.2f MB)...",
+		c.outputFileName,
 		float64(buf.Len())/(1024*1024))
 
-	// Upload to S3
+	// Upload combined file to S3
 	_, err = c.s3Client.PutObject(c.ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(c.bucketName),
-		Key:         aws.String(chunkKey),
+		Key:         aws.String(c.outputFileName),
 		Body:        bytes.NewReader(buf.Bytes()),
 		ContentType: aws.String("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to upload chunk %d to S3: %w", c.chunkNumber, err)
+		return fmt.Errorf("failed to upload combined file: %w", err)
 	}
 
 	duration := time.Since(startTime)
-	log.Printf("✓ Successfully uploaded chunk %d in %s", c.chunkNumber, duration)
-
-	// Clear the batch to free memory
-	c.batch = c.batch[:0]
-
-	// Force garbage collection periodically
-	if c.processedCount%500000 == 0 {
-		runtime.GC()
-	}
+	log.Printf("✓ Successfully combined %d chunks into %s", len(result.Contents), c.outputFileName)
+	log.Printf("Total rows written: %d", totalRows)
+	log.Printf("Combination completed in %s", duration)
 
 	return nil
 }
 
-func (c *ChunkUploader) Finalize() error {
-	// Upload any remaining rows in the batch
-	if err := c.uploadChunk(); err != nil {
-		return err
+// processChunkFile downloads and processes a single chunk file
+func (c *ChunkCombiner) processChunkFile(chunkKey string) (int, error) {
+	// Download chunk from S3
+	getObjectInput := &s3.GetObjectInput{
+		Bucket: aws.String(c.bucketName),
+		Key:    aws.String(chunkKey),
 	}
-	log.Printf("Total rows processed: %d", c.processedCount)
-	log.Printf("Total chunks uploaded: %d", c.chunkNumber)
-	return nil
-}
 
-// ExcelReader handles streaming Excel file processing
-type ExcelReader struct {
-	file      *excelize.File
-	processor RowProcessor
-}
-
-func NewExcelReader(file *excelize.File, processor RowProcessor) *ExcelReader {
-	return &ExcelReader{
-		file:      file,
-		processor: processor,
-	}
-}
-
-// ProcessSheet processes a sheet using streaming to avoid loading all data into memory
-func (r *ExcelReader) ProcessSheet(sheetName string) error {
-	log.Printf("Starting to process sheet: %s", sheetName)
-
-	// Use streaming API to read rows one by one
-	rows, err := r.file.Rows(sheetName)
+	result, err := c.s3Client.GetObject(c.ctx, getObjectInput)
 	if err != nil {
-		return fmt.Errorf("failed to get rows iterator: %w", err)
-	}
-	defer rows.Close()
-
-	rowIndex := 0
-	for rows.Next() {
-		row, err := rows.Columns()
-		if err != nil {
-			return fmt.Errorf("failed to read row %d: %w", rowIndex, err)
-		}
-
-		if err := r.processor.ProcessSheet(rowIndex, row); err != nil {
-			return fmt.Errorf("failed to process row %d: %w", rowIndex, err)
-		}
-
-		rowIndex++
-	}
-
-	if err := rows.Error(); err != nil {
-		return fmt.Errorf("error during row iteration: %w", err)
-	}
-
-	log.Printf("Finished processing sheet: %s with %d rows", sheetName, rowIndex)
-	return nil
-}
-
-// DownloadAndProcessExcel downloads an Excel file from S3 and processes it with streaming
-func DownloadAndProcessExcel(ctx context.Context, s3Client *s3.Client, cfg Config, processor RowProcessor) error {
-	startTime := time.Now()
-	log.Printf("Starting Excel processing from S3")
-
-	log.Printf("Connected to S3 (Region: %s, Endpoint: %s)", cfg.Region, cfg.Endpoint)
-
-	// Check if bucket exists (optional, HeadBucket)
-	_, err := s3Client.HeadBucket(ctx, &s3.HeadBucketInput{
-		Bucket: aws.String(cfg.BucketName),
-	})
-	if err != nil {
-		return fmt.Errorf("bucket %s does not exist or is not accessible: %w", cfg.BucketName, err)
-	}
-
-	log.Printf("Downloading file: %s from bucket: %s", cfg.ObjectName, cfg.BucketName)
-
-	// Get object from S3 with streaming
-	result, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(cfg.BucketName),
-		Key:    aws.String(cfg.ObjectName),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to get object: %w", err)
+		return 0, fmt.Errorf("failed to download chunk: %w", err)
 	}
 	defer result.Body.Close()
 
-	// Get object size from metadata
-	var fileSize int64
-	if result.ContentLength != nil {
-		fileSize = *result.ContentLength
-		log.Printf("File size: %.2f MB", float64(fileSize)/(1024*1024))
-	}
-
-	// Open Excel file from the stream
-	// excelize.OpenReader reads from io.Reader, which is memory-efficient
-	file, err := excelize.OpenReader(result.Body)
+	// Open Excel file from stream
+	chunkFile, err := excelize.OpenReader(result.Body)
 	if err != nil {
-		return fmt.Errorf("failed to open Excel file: %w", err)
+		return 0, fmt.Errorf("failed to open chunk Excel file: %w", err)
 	}
-	defer file.Close()
+	// Explicitly close chunk file to free memory immediately
+	defer func() {
+		if err := chunkFile.Close(); err != nil {
+			log.Printf("Warning: failed to close chunk file: %v", err)
+		}
+	}()
 
-	log.Printf("Excel file opened successfully")
+	// Get first sheet
+	sheets := chunkFile.GetSheetList()
+	if len(sheets) == 0 {
+		return 0, fmt.Errorf("no sheets found in chunk file")
+	}
 
-	// Get list of sheets
-	sheets := file.GetSheetList()
-	log.Printf("Found %d sheet(s): %v", len(sheets), sheets)
+	sheetName := sheets[0]
+	rows, err := chunkFile.Rows(sheetName)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get rows: %w", err)
+	}
+	defer rows.Close()
 
-	// ProcessSheet each sheet
-	reader := NewExcelReader(file, processor)
-	for _, sheetName := range sheets {
-		if err := reader.ProcessSheet(sheetName); err != nil {
-			return fmt.Errorf("failed to process sheet %s: %w", sheetName, err)
+	rowCount := 0
+	for rows.Next() {
+		row, err := rows.Columns()
+		if err != nil {
+			return 0, fmt.Errorf("failed to read row: %w", err)
+		}
+
+		// Skip header row if already written
+		if rowCount == 0 {
+			if !c.headerWritten {
+				// Write header row
+				if err := c.writeRow(row); err != nil {
+					return 0, err
+				}
+				c.headerWritten = true
+			}
+			rowCount++
+			continue
+		}
+
+		// Write data row
+		if err := c.writeRow(row); err != nil {
+			return 0, err
+		}
+		rowCount++
+	}
+
+	// Ensure rows iterator is closed before returning
+	if err := rows.Close(); err != nil {
+		log.Printf("Warning: failed to close rows iterator: %v", err)
+	}
+
+	return rowCount - 1, nil // Subtract header row
+}
+
+// writeRow writes a single row using stream writer
+func (c *ChunkCombiner) writeRow(row []string) error {
+	// Check if we need to create a new sheet
+	if c.currentRow >= c.maxRowsPerSheet {
+		if err := c.createNewSheet(); err != nil {
+			return err
 		}
 	}
 
-	// Finalize processing
-	if err = processor.Finalize(); err != nil {
-		return fmt.Errorf("failed to finalize processing: %w", err)
+	// Create cell slice directly for stream writer (single allocation)
+	cellData := make([]interface{}, len(row))
+	for i, value := range row {
+		cellData[i] = excelize.Cell{Value: value}
 	}
 
-	duration := time.Since(startTime)
-	log.Printf("Excel processing completed in %s", duration)
+	if err := c.streamWriter.SetRow(fmt.Sprintf("A%d", c.currentRow), cellData); err != nil {
+		return fmt.Errorf("failed to write row %d: %w", c.currentRow, err)
+	}
 
+	c.currentRow++
+	return nil
+}
+
+// createNewSheet creates a new sheet when row limit is reached
+func (c *ChunkCombiner) createNewSheet() error {
+	// Flush current sheet
+	if err := c.streamWriter.Flush(); err != nil {
+		return fmt.Errorf("failed to flush current sheet: %w", err)
+	}
+
+	c.currentSheet++
+	sheetName := fmt.Sprintf("Sheet%d", c.currentSheet)
+
+	log.Printf("Creating new sheet: %s (row limit reached)", sheetName)
+
+	// Create new sheet
+	index, err := c.file.NewSheet(sheetName)
+	if err != nil {
+		return fmt.Errorf("failed to create new sheet: %w", err)
+	}
+	c.file.SetActiveSheet(index)
+
+	// Create new stream writer for the new sheet
+	streamWriter, err := c.file.NewStreamWriter(sheetName)
+	if err != nil {
+		return fmt.Errorf("failed to create stream writer for new sheet: %w", err)
+	}
+
+	c.streamWriter = streamWriter
+	c.currentRow = 1
+	c.headerWritten = false // Write header again for new sheet
+
+	return nil
+}
+
+// Close closes the combiner and cleans up resources
+func (c *ChunkCombiner) Close() error {
+	if c.file != nil {
+		return c.file.Close()
+	}
 	return nil
 }
 
@@ -328,9 +329,9 @@ func main() {
 
 	// Load configuration from environment variables
 	config := Config{
-		Region:   getEnv("AWS_REGION", "us-east-1"),
-		Endpoint: getEnv("S3_ENDPOINT", "http://host.docker.internal:9000"), // Empty for AWS S3, set for MinIO host.docker.internal
-		// Endpoint:        getEnv("S3_ENDPOINT", "http://localhost:9000"), // Empty for AWS S3, set for MinIO host.docker.internal
+		Region: getEnv("AWS_REGION", "us-east-1"),
+		// Endpoint: getEnv("S3_ENDPOINT", "http://host.docker.internal:9000"), // Empty for AWS S3, set for MinIO host.docker.internal
+		Endpoint:        getEnv("S3_ENDPOINT", "http://localhost:9000"), // Empty for AWS S3, set for MinIO host.docker.internal
 		AccessKeyID:     getEnv("AWS_ACCESS_KEY_ID", "minioadmin"),
 		SecretAccessKey: getEnv("AWS_SECRET_ACCESS_KEY", "minioadmin"),
 		BucketName:      getEnv("S3_BUCKET", "excel-files"),
@@ -338,29 +339,25 @@ func main() {
 		ForcePathStyle:  getEnv("S3_FORCE_PATH_STYLE", "true") == "true", // true for MinIO
 	}
 
-	// Get processing mode
-	chunkSize := 10000 // Default: 10k rows per chunk
+	// Get combine mode configuration
+	chunkPrefix := getEnv("CHUNK_PREFIX", "100mb_chunk_")      // Prefix for chunk files
+	outputFile := getEnv("OUTPUT_FILE", "100mb_combined.xlsx") // Output file for combine mode
 
-	log.Printf("Configuration: Region=%s, Endpoint=%s, Bucket=%s, File=%s",
-		config.Region, config.Endpoint, config.BucketName, config.ObjectName)
+	log.Printf("Configuration: Region=%s, Endpoint=%s, Bucket=%s",
+		config.Region, config.Endpoint, config.BucketName)
+	log.Printf("Chunk prefix: %s", chunkPrefix)
+	log.Printf("Output file: %s", outputFile)
 
-	// Create context with timeout (adjust based on Lambda timeout)
-	// For Lambda: use context from Lambda handler or set shorter timeout
-	timeout := getEnv("PROCESSING_TIMEOUT", "5m") // Default 5 minutes
+	// Create context with timeout
+	timeout := getEnv("PROCESSING_TIMEOUT", "10m") // Default 10 minutes
 	timeoutDuration, err := time.ParseDuration(timeout)
 	if err != nil {
-		timeoutDuration = 5 * time.Minute
+		timeoutDuration = 10 * time.Minute
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeoutDuration)
 	defer cancel()
 
-	var processor RowProcessor
-
-	// Mode: Create chunks and upload to S3
-	log.Printf("Mode: Split file into chunks and upload to S3")
-	log.Printf("Chunk size: %d rows per file", chunkSize)
-
-	// Initialize S3 client for uploading chunks
+	// Initialize S3 client
 	var awsCfg aws.Config
 
 	if config.Endpoint != "" {
@@ -400,13 +397,17 @@ func main() {
 		o.UsePathStyle = config.ForcePathStyle
 	})
 
-	// Extract base filename without extension
-	baseFileName := strings.TrimSuffix(config.ObjectName, ".xlsx")
-	processor = NewChunkUploader(ctx, s3Client, config.BucketName, baseFileName, chunkSize)
+	// Combine chunks into one file
+	log.Printf("Starting chunk combination...")
 
-	// ProcessSheet the Excel file
-	if err := DownloadAndProcessExcel(ctx, s3Client, config, processor); err != nil {
-		log.Fatalf("Error processing Excel file: %v", err)
+	combiner, err := NewChunkCombiner(ctx, s3Client, config.BucketName, chunkPrefix, outputFile)
+	if err != nil {
+		log.Fatalf("Failed to create chunk combiner: %v", err)
+	}
+	defer combiner.Close()
+
+	if err := combiner.CombineChunks(); err != nil {
+		log.Fatalf("Error combining chunks: %v", err)
 	}
 
 	// Memory profiling
