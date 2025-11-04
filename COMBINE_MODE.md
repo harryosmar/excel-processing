@@ -318,7 +318,7 @@ Chunk N (S3) → Read Stream → Write Stream → Buffer
 1. **One chunk at a time**: Never loads all chunks into memory
 2. **Streaming read**: Rows processed one by one
 3. **Streaming write**: Rows written immediately
-4. **Periodic GC**: Garbage collection every 100k rows
+4. **Periodic GC**: Garbage collection every batch
 5. **No intermediate storage**: Direct chunk-to-combined transfer
 
 ## Comparison: Modes

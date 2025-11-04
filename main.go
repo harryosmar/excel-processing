@@ -1,9 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/xuri/excelize/v2"
 )
@@ -118,28 +119,46 @@ func (c *ChunkCombiner) CombineChunks() error {
 		return fmt.Errorf("failed to flush stream writer: %w", err)
 	}
 
-	log.Printf("Writing combined file to temporary buffer...")
+	log.Printf("Streaming combined file to S3 using multipart upload...")
 
-	// Write to buffer (needed for S3 upload with proper content length)
-	var buf bytes.Buffer
-	if err := c.file.Write(&buf); err != nil {
-		return fmt.Errorf("failed to write Excel to buffer: %w", err)
+	// Create a pipe for streaming upload
+	pipeReader, pipeWriter := io.Pipe()
+
+	// Upload in a goroutine using multipart upload
+	uploadErr := make(chan error, 1)
+	go func() {
+		defer pipeReader.Close()
+		
+		// Use S3 manager for multipart upload (handles chunking automatically)
+		uploader := manager.NewUploader(c.s3Client, func(u *manager.Uploader) {
+			u.PartSize = 10 * 1024 * 1024 // 10MB parts
+			u.Concurrency = 1             // Sequential upload to save memory
+		})
+		
+		_, err := uploader.Upload(c.ctx, &s3.PutObjectInput{
+			Bucket:      aws.String(c.bucketName),
+			Key:         aws.String(c.outputFileName),
+			Body:        pipeReader,
+			ContentType: aws.String("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+		})
+		uploadErr <- err
+	}()
+
+	// Write Excel file directly to pipe (streaming)
+	log.Printf("Writing Excel file to stream...")
+	if err := c.file.Write(pipeWriter); err != nil {
+		pipeWriter.Close()
+		return fmt.Errorf("failed to write Excel to stream: %w", err)
 	}
+	pipeWriter.Close()
 
-	log.Printf("Uploading combined file to S3: %s (size: %.2f MB)...",
-		c.outputFileName,
-		float64(buf.Len())/(1024*1024))
-
-	// Upload combined file to S3
-	_, err = c.s3Client.PutObject(c.ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(c.bucketName),
-		Key:         aws.String(c.outputFileName),
-		Body:        bytes.NewReader(buf.Bytes()),
-		ContentType: aws.String("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-	})
-	if err != nil {
+	// Wait for upload to complete
+	log.Printf("Waiting for upload to complete...")
+	if err := <-uploadErr; err != nil {
 		return fmt.Errorf("failed to upload combined file: %w", err)
 	}
+	
+	log.Printf("✓ Upload completed successfully")
 
 	duration := time.Since(startTime)
 	log.Printf("✓ Successfully combined %d chunks into %s", len(result.Contents), c.outputFileName)
