@@ -1,7 +1,7 @@
 
 ```shell
 # Limit memory to 512MB
-docker run --memory=512m -v $(pwd):/app golang:1.21 \
+docker run --memory=512m -v $(pwd):/app golang:1.24 \
   sh -c "cd /app && go run main.go"
 ```
 

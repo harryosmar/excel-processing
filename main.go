@@ -69,7 +69,10 @@ func (c *ChunkUploader) ProcessSheet(rowIndex int, row []string) error {
 		return nil
 	}
 
-	c.batch = append(c.batch, row)
+	// Create a copy of the row to avoid retaining references to the original slice
+	rowCopy := make([]string, len(row))
+	copy(rowCopy, row)
+	c.batch = append(c.batch, rowCopy)
 	c.processedCount++
 
 	// Upload chunk when batch is full
@@ -137,11 +140,18 @@ func (c *ChunkUploader) uploadChunk() error {
 		chunkKey,
 		float64(buf.Len())/(1024*1024))
 
+	// Check context cancellation before upload
+	if err := c.ctx.Err(); err != nil {
+		return fmt.Errorf("context cancelled before upload: %w", err)
+	}
+
 	// Upload to S3
+	// Use buf.Bytes() directly in NewReader to avoid extra allocation
+	bufBytes := buf.Bytes()
 	_, err = c.s3Client.PutObject(c.ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(c.bucketName),
 		Key:         aws.String(chunkKey),
-		Body:        bytes.NewReader(buf.Bytes()),
+		Body:        bytes.NewReader(bufBytes),
 		ContentType: aws.String("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
 	})
 	if err != nil {
@@ -151,11 +161,12 @@ func (c *ChunkUploader) uploadChunk() error {
 	duration := time.Since(startTime)
 	log.Printf("✓ Successfully uploaded chunk %d in %s", c.chunkNumber, duration)
 
-	// Clear the batch to free memory
-	c.batch = c.batch[:0]
+	// Clear the batch and reset capacity to free memory
+	// Recreate the batch slice to release the underlying array
+	c.batch = make([][]string, 0, c.batchSize)
 
-	// Force garbage collection periodically
-	if c.processedCount%500000 == 0 {
+	// Force garbage collection more frequently for better memory management
+	if c.chunkNumber%10 == 0 {
 		runtime.GC()
 	}
 
@@ -169,6 +180,11 @@ func (c *ChunkUploader) Finalize() error {
 	}
 	log.Printf("Total rows processed: %d", c.processedCount)
 	log.Printf("Total chunks uploaded: %d", c.chunkNumber)
+
+	// Release memory by clearing references
+	c.batch = nil
+	c.headerRow = nil
+
 	return nil
 }
 
@@ -290,6 +306,11 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// bToMb converts bytes to megabytes
+func bToMb(b uint64) uint64 {
+	return b / 1024 / 1024
 }
 
 func main() {
