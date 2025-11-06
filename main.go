@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,13 +23,14 @@ import (
 
 // Config holds the S3 configuration
 type Config struct {
-	Region          string
-	Endpoint        string // Optional: for S3-compatible services like MinIO
-	AccessKeyID     string
-	SecretAccessKey string
-	BucketName      string
-	ObjectName      string
-	ForcePathStyle  bool // Set to true for MinIO/S3-compatible services
+	Region               string
+	Endpoint             string // Optional: for S3-compatible services like MinIO
+	AccessKeyID          string
+	SecretAccessKey      string
+	BucketName           string
+	ObjectName           string
+	ForcePathStyle       bool // Set to true for MinIO/S3-compatible services
+	MaxConcurrentUploads int  // Number of concurrent S3 uploads
 }
 
 // RowProcessor defines the interface for processing each row
@@ -48,9 +50,12 @@ type ChunkUploader struct {
 	bucketName     string
 	baseFileName   string
 	headerRow      []string
+	uploadSem      chan struct{} // Semaphore for concurrent uploads
 }
 
-func NewChunkUploader(ctx context.Context, s3Client *s3.Client, bucketName, baseFileName string, batchSize int) *ChunkUploader {
+func NewChunkUploader(ctx context.Context, s3Client *s3.Client, bucketName, baseFileName string, batchSize, maxConcurrentUploads int) *ChunkUploader {
+	// Create semaphore to limit concurrent uploads
+	uploadSem := make(chan struct{}, maxConcurrentUploads)
 	return &ChunkUploader{
 		ctx:          ctx,
 		s3Client:     s3Client,
@@ -58,6 +63,7 @@ func NewChunkUploader(ctx context.Context, s3Client *s3.Client, bucketName, base
 		baseFileName: baseFileName,
 		batchSize:    batchSize,
 		batch:        make([][]string, 0, batchSize),
+		uploadSem:    uploadSem,
 	}
 }
 
@@ -110,20 +116,38 @@ func (c *ChunkUploader) uploadChunk() error {
 	}
 	f.SetActiveSheet(index)
 
-	// Write header row
+	// Use streaming writer for better performance
+	// Options: compression level 1 (best speed) vs 9 (best compression)
+	streamWriter, err := f.NewStreamWriter(sheetName)
+	if err != nil {
+		return fmt.Errorf("failed to create stream writer: %w", err)
+	}
+
+	// Write header row via stream
 	if c.headerRow != nil {
-		for colIdx, value := range c.headerRow {
-			cell, _ := excelize.CoordinatesToCellName(colIdx+1, 1)
-			f.SetCellValue(sheetName, cell, value)
+		headerCells := make([]interface{}, len(c.headerRow))
+		for i, val := range c.headerRow {
+			headerCells[i] = val
+		}
+		if err := streamWriter.SetRow("A1", headerCells); err != nil {
+			return fmt.Errorf("failed to write header: %w", err)
 		}
 	}
 
-	// Write data rows
+	// Write data rows via stream
 	for rowIdx, row := range c.batch {
-		for colIdx, value := range row {
-			cell, _ := excelize.CoordinatesToCellName(colIdx+1, rowIdx+2) // +2 because header is row 1
-			f.SetCellValue(sheetName, cell, value)
+		cells := make([]interface{}, len(row))
+		for i, val := range row {
+			cells[i] = val
 		}
+		cellRef, _ := excelize.CoordinatesToCellName(1, rowIdx+2)
+		if err := streamWriter.SetRow(cellRef, cells); err != nil {
+			return fmt.Errorf("failed to write row %d: %w", rowIdx, err)
+		}
+	}
+
+	if err := streamWriter.Flush(); err != nil {
+		return fmt.Errorf("failed to flush stream writer: %w", err)
 	}
 
 	// Write to buffer
@@ -145,21 +169,32 @@ func (c *ChunkUploader) uploadChunk() error {
 		return fmt.Errorf("context cancelled before upload: %w", err)
 	}
 
-	// Upload to S3
-	// Use buf.Bytes() directly in NewReader to avoid extra allocation
+	// Upload to S3 asynchronously with semaphore to limit concurrency
 	bufBytes := buf.Bytes()
-	_, err = c.s3Client.PutObject(c.ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(c.bucketName),
-		Key:         aws.String(chunkKey),
-		Body:        bytes.NewReader(bufBytes),
-		ContentType: aws.String("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to upload chunk %d to S3: %w", c.chunkNumber, err)
-	}
+	chunkNum := c.chunkNumber
+
+	// Acquire semaphore slot, "Park in a spot" (blocks if all n spots full)
+	c.uploadSem <- struct{}{}
+
+	go func() {
+		defer func() { <-c.uploadSem }() // Release semaphore, "Leave the spot" when done
+
+		uploadStart := time.Now()
+		_, uploadErr := c.s3Client.PutObject(c.ctx, &s3.PutObjectInput{
+			Bucket:      aws.String(c.bucketName),
+			Key:         aws.String(chunkKey),
+			Body:        bytes.NewReader(bufBytes),
+			ContentType: aws.String("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+		})
+		if uploadErr != nil {
+			log.Printf("✗ Failed to upload chunk %d: %v", chunkNum, uploadErr)
+			return
+		}
+		log.Printf("✓ Successfully uploaded chunk %d in %s", chunkNum, time.Since(uploadStart))
+	}()
 
 	duration := time.Since(startTime)
-	log.Printf("✓ Successfully uploaded chunk %d in %s", c.chunkNumber, duration)
+	log.Printf("✓ Chunk %d prepared in %s (uploading in background)", c.chunkNumber, duration)
 
 	// Clear the batch and reset capacity to free memory
 	// Recreate the batch slice to release the underlying array
@@ -178,6 +213,14 @@ func (c *ChunkUploader) Finalize() error {
 	if err := c.uploadChunk(); err != nil {
 		return err
 	}
+
+	// Wait for all background uploads to complete
+	log.Printf("Waiting for background uploads to complete...")
+	for i := 0; i < cap(c.uploadSem); i++ {
+		c.uploadSem <- struct{}{}
+	}
+	log.Printf("All uploads completed")
+
 	log.Printf("Total rows processed: %d", c.processedCount)
 	log.Printf("Total chunks uploaded: %d", c.chunkNumber)
 
@@ -348,15 +391,21 @@ func main() {
 	}
 
 	// Load configuration from environment variables
+	maxConcurrentUploads := 3 // Default
+	if val, err := strconv.Atoi(getEnv("MAX_CONCURRENT_UPLOADS", "3")); err == nil && val > 0 {
+		maxConcurrentUploads = val
+	}
+
 	config := Config{
 		Region:   getEnv("AWS_REGION", "us-east-1"),
 		Endpoint: getEnv("S3_ENDPOINT", "http://host.docker.internal:9000"), // Empty for AWS S3, set for MinIO host.docker.internal
 		// Endpoint:        getEnv("S3_ENDPOINT", "http://localhost:9000"), // Empty for AWS S3, set for MinIO host.docker.internal
-		AccessKeyID:     getEnv("AWS_ACCESS_KEY_ID", "minioadmin"),
-		SecretAccessKey: getEnv("AWS_SECRET_ACCESS_KEY", "minioadmin"),
-		BucketName:      getEnv("S3_BUCKET", "excel-files"),
-		ObjectName:      getEnv("EXCEL_FILE_NAME", "100mb.xlsx"),
-		ForcePathStyle:  getEnv("S3_FORCE_PATH_STYLE", "true") == "true", // true for MinIO
+		AccessKeyID:          getEnv("AWS_ACCESS_KEY_ID", "minioadmin"),
+		SecretAccessKey:      getEnv("AWS_SECRET_ACCESS_KEY", "minioadmin"),
+		BucketName:           getEnv("S3_BUCKET", "excel-files"),
+		ObjectName:           getEnv("EXCEL_FILE_NAME", "100mb.xlsx"),
+		ForcePathStyle:       getEnv("S3_FORCE_PATH_STYLE", "true") == "true", // true for MinIO
+		MaxConcurrentUploads: maxConcurrentUploads,
 	}
 
 	// Get processing mode
@@ -364,6 +413,7 @@ func main() {
 
 	log.Printf("Configuration: Region=%s, Endpoint=%s, Bucket=%s, File=%s",
 		config.Region, config.Endpoint, config.BucketName, config.ObjectName)
+	log.Printf("Max concurrent uploads: %d", config.MaxConcurrentUploads)
 
 	// Create context with timeout (adjust based on Lambda timeout)
 	// For Lambda: use context from Lambda handler or set shorter timeout
@@ -423,7 +473,7 @@ func main() {
 
 	// Extract base filename without extension
 	baseFileName := strings.TrimSuffix(config.ObjectName, ".xlsx")
-	processor = NewChunkUploader(ctx, s3Client, config.BucketName, baseFileName, chunkSize)
+	processor = NewChunkUploader(ctx, s3Client, config.BucketName, baseFileName, chunkSize, config.MaxConcurrentUploads)
 
 	// ProcessSheet the Excel file
 	if err := DownloadAndProcessExcel(ctx, s3Client, config, processor); err != nil {
